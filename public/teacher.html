@@ -138,7 +138,7 @@
     const s = students.get(id);
     if (!s) return;
     s.sharing = sharing;
-    if (!sharing) closePeer(s);
+    if (!sharing) { closePeer(s); clearFrame(s); }
     renderGrid();
   });
 
@@ -173,12 +173,18 @@
 
   // ---------- 학생 화면 타일 ----------
   function addStudent(st) {
-    const s = { name: st.name, joinedAt: st.joinedAt, sharing: st.sharing, pc: null, stream: null, tile: null };
+    if (students.has(st.id)) return;
+    const s = { name: st.name, joinedAt: st.joinedAt, sharing: st.sharing, pc: null, stream: null, tile: null,
+      rtcLive: false, imgUrl: null, lastFrame: 0 };
     const video = el('video', { autoplay: '', playsinline: '' });
     video.muted = true;
+    // 영상이 실제로 들어오기 시작해야 '연결됨'으로 봄
+    video.addEventListener('resize', () => { if (video.videoWidth) { s.rtcLive = true; renderGrid(); } });
+    video.addEventListener('playing', () => { if (video.videoWidth) { s.rtcLive = true; renderGrid(); } });
+    const img = el('img', { alt: '', style: 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#111827' });
     const waiting = el('div', { class: 'waiting' });
-    s.tile = el('div', { class: 'tile' }, video, waiting, el('div', { class: 'label', text: st.name }));
-    s.video = video; s.waiting = waiting;
+    s.tile = el('div', { class: 'tile' }, video, img, waiting, el('div', { class: 'label', text: st.name }));
+    s.video = video; s.img = img; s.waiting = waiting;
     s.tile.addEventListener('click', () => openFocus(st.id));
     students.set(st.id, s);
     renderGrid();
@@ -187,6 +193,7 @@
     const s = students.get(id);
     if (!s) return;
     closePeer(s);
+    clearFrame(s);
     s.tile.remove();
     students.delete(id);
     renderGrid();
@@ -194,8 +201,37 @@
   function closePeer(s) {
     if (s.pc) { s.pc.close(); s.pc = null; }
     s.stream = null;
+    s.rtcLive = false;
     if (s.video) s.video.srcObject = null;
   }
+  function clearFrame(s) {
+    if (s.imgUrl) URL.revokeObjectURL(s.imgUrl);
+    s.imgUrl = null; s.lastFrame = 0;
+    if (s.img) s.img.removeAttribute('src');
+  }
+
+  // 사진 방식으로 들어온 학생 화면
+  let focusId = null, focusImg = null;
+  socket.on('frame', ({ id, buf }) => {
+    const s = students.get(id);
+    if (!s) return;
+    const url = URL.createObjectURL(new Blob([buf], { type: 'image/jpeg' }));
+    const old = s.imgUrl;
+    s.imgUrl = url;
+    s.img.src = url;
+    if (focusId === id && focusImg) focusImg.src = url;
+    // 이전 사진은 새 사진이 그려진 뒤에 정리
+    if (old) setTimeout(() => URL.revokeObjectURL(old), 3000);
+    const first = !s.lastFrame;
+    s.lastFrame = Date.now();
+    if (first) renderGrid();
+  });
+  // 사진이 10초 넘게 안 오면 '연결하는 중'으로 표시
+  setInterval(() => {
+    let changed = false;
+    students.forEach((s) => { if (s.lastFrame && Date.now() - s.lastFrame > 10000) { clearFrame(s); changed = true; } });
+    if (changed) renderGrid();
+  }, 5000);
   function attachVideo(s) {
     s.video.srcObject = s.stream;
     s.video.play().catch(() => {});
@@ -207,12 +243,14 @@
     const arr = [...students.entries()].sort((a, b) =>
       sortBy === 'name' ? a[1].name.localeCompare(b[1].name, 'ko') : a[1].joinedAt - b[1].joinedAt);
     arr.forEach(([, s]) => {
-      const live = !!s.stream;
+      const useImg = !s.rtcLive && !!s.lastFrame;
+      const live = s.rtcLive || useImg;
+      s.img.classList.toggle('hidden', !useImg);
       s.waiting.textContent = live ? '' : (s.sharing ? '연결하는 중…' : '아직 화면 공유 전이에요');
       s.waiting.classList.toggle('hidden', live);
       grid.append(s.tile); // 정렬 순서대로 다시 붙임
     });
-    const sharing = arr.filter(([, s]) => s.stream).length;
+    const sharing = arr.filter(([, s]) => s.rtcLive || s.lastFrame).length;
     $('#counter').textContent = `들어온 학생 ${arr.length}명 · 화면 공유 중 ${sharing}명`;
     $('#emptyGrid').classList.toggle('hidden', arr.length > 0);
   }
@@ -224,15 +262,21 @@
     const ov = $('#overlay');
     const v = el('video', { autoplay: '', playsinline: '' });
     v.muted = true;
-    if (s.stream) v.srcObject = s.stream;
+    focusId = id; focusImg = null;
+    let body;
+    if (s.rtcLive && s.stream) { v.srcObject = s.stream; body = v; }
+    else if (s.lastFrame) {
+      focusImg = el('img', { src: s.imgUrl, alt: s.name, style: 'max-width:100%;max-height:calc(100vh - 100px);border-radius:10px;background:#000' });
+      body = focusImg;
+    } else body = el('div', { class: 'hint', text: '아직 화면 공유 전이에요.' });
     ov.replaceChildren(
       el('div', { class: 'ov-head' }, '🙂 ' + s.name, el('button', { class: 'btn', text: '닫기 (Esc)', onclick: closeOverlay })),
-      s.stream ? v : el('div', { class: 'hint', text: '아직 화면 공유 전이에요.' })
+      body
     );
     ov.classList.remove('hidden');
-    v.play && v.play().catch(() => {});
+    if (body === v) v.play().catch(() => {});
   }
-  function closeOverlay() { $('#overlay').classList.add('hidden'); $('#overlay').replaceChildren(); }
+  function closeOverlay() { focusId = null; focusImg = null; $('#overlay').classList.add('hidden'); $('#overlay').replaceChildren(); }
   $('#overlay').addEventListener('click', (e) => { if (e.target.id === 'overlay') closeOverlay(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeOverlay(); });
 

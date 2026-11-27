@@ -141,6 +141,7 @@
     socket.on('teacher-offline', () => {
       teacherId = null;
       if (pc) { pc.close(); pc = null; }
+      if (stream) startSnaps();
     });
 
     socket.on('signal', async ({ from, data }) => {
@@ -221,6 +222,8 @@
   function stopShare() {
     if (stream) stream.getTracks().forEach((t) => t.stop());
     stream = null;
+    stopSnaps();
+    clearTimeout(fallbackTimer);
     if (pc) { pc.close(); pc = null; }
     if (socket) socket.emit('share-state', false);
     setShareUI(false);
@@ -237,15 +240,80 @@
     document.title = on ? '🟢 공유 중 — 우리 반 교실' : '우리 반 교실 — 학생';
   }
 
+  // ---------- 사진 방식 (학교망에서 직접 연결이 막힐 때) ----------
+  // 1.5초마다 화면을 사진으로 찍어 서버를 거쳐 선생님께 보냄
+  let snapTimer = null, snapBusy = false, grabber = null, snapVideo = null;
+  const snapCanvas = document.createElement('canvas');
+  // 창이 뒤로 가도 느려지지 않도록 Worker 타이머를 씀
+  const tickWorker = new Worker(URL.createObjectURL(new Blob(
+    ['let t=null;onmessage=e=>{clearInterval(t);if(e.data>0)t=setInterval(()=>postMessage(1),e.data)}'],
+    { type: 'text/javascript' })));
+  tickWorker.onmessage = () => snap();
+
+  function startSnaps() {
+    if (snapTimer || !stream) return;
+    snapTimer = true;
+    const track = stream.getVideoTracks()[0];
+    grabber = (window.ImageCapture && track) ? new ImageCapture(track) : null;
+    if (!grabber) {
+      snapVideo = document.createElement('video');
+      snapVideo.muted = true;
+      snapVideo.srcObject = stream;
+      snapVideo.play().catch(() => {});
+    }
+    tickWorker.postMessage(1500);
+    snap();
+  }
+  function stopSnaps() {
+    tickWorker.postMessage(0);
+    snapTimer = null; grabber = null;
+    if (snapVideo) { snapVideo.srcObject = null; snapVideo = null; }
+  }
+  async function snap() {
+    if (!snapTimer || snapBusy || !stream || !socket || !socket.connected) return;
+    snapBusy = true;
+    try {
+      let src, w, h;
+      if (grabber) { src = await grabber.grabFrame(); w = src.width; h = src.height; }
+      else { src = snapVideo; w = src.videoWidth; h = src.videoHeight; }
+      if (w && h) {
+        const scale = Math.min(1, 960 / w);
+        snapCanvas.width = Math.round(w * scale);
+        snapCanvas.height = Math.round(h * scale);
+        snapCanvas.getContext('2d').drawImage(src, 0, 0, snapCanvas.width, snapCanvas.height);
+        if (src.close) src.close();
+        const blob = await new Promise((r) => snapCanvas.toBlob(r, 'image/jpeg', 0.55));
+        if (blob && blob.size < 400 * 1024) socket.emit('frame', await blob.arrayBuffer());
+      }
+    } catch (e) {
+      // 사진 찍기가 실패하면 다음 번에 다시 시도
+      grabber = null;
+      if (!snapVideo && stream) { snapVideo = document.createElement('video'); snapVideo.muted = true; snapVideo.srcObject = stream; snapVideo.play().catch(() => {}); }
+    }
+    snapBusy = false;
+  }
+
+  let fallbackTimer = null;
   async function startPeer() {
-    if (!stream || !teacherId || !socket) return;
+    if (!stream || !socket) return;
+    // 선생님이 없거나 직접 연결이 6초 안에 안 되면 사진 방식으로
+    clearTimeout(fallbackTimer);
+    fallbackTimer = setTimeout(() => { if (stream && (!pc || pc.connectionState !== 'connected')) startSnaps(); }, 6000);
+    if (!teacherId) return;
     if (pc) pc.close();
     const target = teacherId;
     const conn = new RTCPeerConnection(RTC_CONFIG);
     pc = conn;
     conn.onicecandidate = (e) => { if (e.candidate) socket.emit('signal', { to: target, data: { candidate: e.candidate } }); };
     conn.onconnectionstatechange = () => {
-      if (conn === pc && conn.connectionState === 'failed') setTimeout(() => { if (conn === pc) startPeer(); }, 2000);
+      if (conn !== pc) return;
+      const st = conn.connectionState;
+      if (st === 'connected') stopSnaps();
+      else if (st === 'failed' || st === 'disconnected') {
+        startSnaps();
+        // 직접 연결은 30초 뒤에 한 번 더 시도
+        if (st === 'failed') setTimeout(() => { if (conn === pc && stream) startPeer(); }, 30000);
+      }
     };
     stream.getTracks().forEach((t) => {
       const sender = conn.addTrack(t, stream);

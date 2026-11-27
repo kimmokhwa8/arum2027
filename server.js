@@ -196,8 +196,9 @@ app.delete('/api/room/:code/posts', (req, res) => {
 });
 
 // ---------- 실시간 (화면 공유 연결) ----------
-const live = {}; // code -> { teacherId, students: Map(socketId -> {name, joinedAt, sharing}) }
-const liveOf = (code) => (live[code] = live[code] || { teacherId: null, students: new Map() });
+const live = {}; // code -> { teacherId, teachers: Set, students: Map(socketId -> {name, joinedAt, sharing}) }
+const liveOf = (code) => (live[code] = live[code] || { teacherId: null, teachers: new Set(), students: new Map() });
+const MAX_FRAME = 400 * 1024; // 화면 사진 한 장 최대 크기
 const studentList = (L) => [...L.students.entries()].map(([id, s]) => ({ id, ...s }));
 
 io.on('connection', (socket) => {
@@ -212,6 +213,8 @@ io.on('connection', (socket) => {
       if (!isTeacher(room, msg.teacherKey)) return ack({ error: '선생님 확인에 실패했어요.' });
       socket.data = { code, role: 'teacher' };
       socket.join(code);
+      socket.join(code + ':t'); // 학생 화면 사진을 받는 선생님 전용 방
+      L.teachers.add(socket.id);
       L.teacherId = socket.id;
       socket.to(code).emit('teacher-online', { teacherId: socket.id });
       return ack({ ok: true, students: studentList(L), state: publicState(room) });
@@ -223,7 +226,7 @@ io.on('connection', (socket) => {
     socket.join(code);
     const s = { name, joinedAt: Date.now(), sharing: false };
     L.students.set(socket.id, s);
-    if (L.teacherId) io.to(L.teacherId).emit('student-joined', { id: socket.id, ...s });
+    io.to(code + ':t').emit('student-joined', { id: socket.id, ...s });
     ack({ ok: true, teacherId: L.teacherId, state: publicState(room) });
   });
 
@@ -244,7 +247,19 @@ io.on('connection', (socket) => {
     const s = L.students.get(socket.id);
     if (!s) return;
     s.sharing = !!sharing;
-    if (L.teacherId) io.to(L.teacherId).emit('student-state', { id: socket.id, sharing: s.sharing });
+    io.to(d.code + ':t').emit('student-state', { id: socket.id, sharing: s.sharing });
+  });
+
+  // 직접 연결이 막힌 학교망에서는 학생 화면을 사진으로 찍어 서버를 거쳐 보냄
+  socket.on('frame', (buf) => {
+    const d = socket.data || {};
+    if (d.role !== 'student') return;
+    if (!buf || !(buf instanceof Buffer) || buf.length > MAX_FRAME) return;
+    const L = liveOf(d.code);
+    const s = L.students.get(socket.id);
+    if (!s) return;
+    if (!s.sharing) { s.sharing = true; io.to(d.code + ':t').emit('student-state', { id: socket.id, sharing: true }); }
+    io.to(d.code + ':t').volatile.emit('frame', { id: socket.id, buf });
   });
 
   socket.on('end-all', () => {
@@ -267,10 +282,16 @@ io.on('connection', (socket) => {
     const L = liveOf(d.code);
     if (d.role === 'student') {
       L.students.delete(socket.id);
-      if (L.teacherId) io.to(L.teacherId).emit('student-left', { id: socket.id });
-    } else if (d.role === 'teacher' && L.teacherId === socket.id) {
-      L.teacherId = null;
-      socket.to(d.code).emit('teacher-offline');
+      io.to(d.code + ':t').emit('student-left', { id: socket.id });
+    } else if (d.role === 'teacher') {
+      L.teachers.delete(socket.id);
+      if (L.teacherId === socket.id) {
+        // 다른 선생님 창이 열려 있으면 그 창이 이어받음
+        const rest = [...L.teachers];
+        L.teacherId = rest.length ? rest[rest.length - 1] : null;
+        if (L.teacherId) socket.to(d.code).emit('teacher-online', { teacherId: L.teacherId });
+        else socket.to(d.code).emit('teacher-offline');
+      }
     }
   });
 });
