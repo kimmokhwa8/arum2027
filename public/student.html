@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>우리 반 교실 — 학생</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- 입장 화면 -->
+<section id="joinView" class="join">
+  <div class="card" style="padding:28px">
+    <div style="font-size:44px;text-align:center">🙋</div>
+    <h2 style="text-align:center">교실에 들어가기</h2>
+    <label class="field" for="codeIn">교실 코드 (숫자 6자리)</label>
+    <input type="text" id="codeIn" class="code-input" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="000000">
+    <label class="field" for="nameIn">내 이름</label>
+    <input type="text" id="nameIn" maxlength="20" placeholder="예: 김다은" style="font-size:22px">
+    <label class="check"><input type="checkbox" id="rememberIn" checked> 이 컴퓨터에 코드와 이름 저장하기</label>
+    <button id="joinBtn" class="btn primary big" style="width:100%">들어가기</button>
+    <div id="joinErr" class="error"></div>
+  </div>
+  <p class="muted" style="text-align:center"><a href="/">처음 화면으로</a></p>
+</section>
+
+<!-- 교실 화면 -->
+<section id="roomView" class="hidden">
+  <div id="sharingBar" class="sharing-bar hidden"><span class="dot"></span> 내 화면 공유 중 · 선생님이 보고 있어요</div>
+  <header class="topbar">
+    <span class="brand">🏫 우리 반 교실</span>
+    <span class="code-chip" id="codeChip"></span>
+    <span id="meName" style="font-weight:700"></span>
+    <nav class="tabs">
+      <button class="tab active" data-panel="pShare">📺 화면 공유</button>
+      <button class="tab" data-panel="pPrompt">📋 프롬프트</button>
+      <button class="tab" data-panel="pBoard">📁 게시판</button>
+    </nav>
+    <span class="spacer"></span>
+    <button id="leaveBtn" class="btn small">나가기</button>
+  </header>
+
+  <main>
+    <div id="linkBar" class="link-bar hidden">
+      🔗 선생님이 보낸 링크
+      <span class="url" id="linkUrl"></span>
+      <button class="btn primary" id="linkOpen">열기</button>
+      <button class="btn small" id="linkClose">닫기</button>
+    </div>
+
+    <section id="pShare" class="panel active">
+      <div class="card share-box">
+        <div id="shareStatus" class="status-big wait">아직 화면을 공유하지 않았어요</div>
+        <div id="shareIntro">
+          <h2>내 화면을 선생님께 보여 주기</h2>
+          <ol class="steps">
+            <li>아래 <b>[화면 공유 시작]</b> 버튼을 눌러요.</li>
+            <li>뜨는 창에서 <b>'전체 화면'</b>을 고르고 화면 그림을 한 번 눌러요.</li>
+            <li><b>[공유]</b> 버튼을 누르면 끝!</li>
+          </ol>
+        </div>
+        <div class="row" style="justify-content:center">
+          <button id="shareBtn" class="btn green big">📺 화면 공유 시작</button>
+          <button id="stopBtn" class="btn big hidden">공유 멈추기</button>
+        </div>
+        <p id="teacherWait" class="muted hidden" style="margin-top:18px">선생님이 아직 교실을 열지 않았어요. 선생님이 들어오면 자동으로 연결돼요.</p>
+        <p class="muted" style="margin-top:22px">공유하는 동안 이 창은 닫지 말고, 다른 창이나 탭에서 활동하면 돼요.<br>
+          화면은 녹화하거나 저장하지 않아요.</p>
+      </div>
+    </section>
+
+    <section id="pPrompt" class="panel">
+      <p class="muted" style="margin-top:0">📋 버튼을 누르면 복사돼요. 쓰고 싶은 곳(제미나이, 클로드 등)에 가서 <b>Ctrl + V</b>로 붙여 넣어요.</p>
+      <div id="promptList" class="prompt-list"></div>
+    </section>
+
+    <section id="pBoard" class="panel">
+      <div id="boardRoot"></div>
+    </section>
+  </main>
+</section>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/common.js"></script>
+<script>
+(() => {
+  const saved = store.get('student', {});
+  $('#codeIn').value = saved.code || new URLSearchParams(location.search).get('code') || '';
+  $('#nameIn').value = saved.name || '';
+
+  let code = '', name = '';
+  let socket = null;
+  let teacherId = null;
+  let stream = null;
+  let pc = null;
+  let board = null;
+  const myPosts = new Set(store.get('my-posts', []));
+
+  $('#codeIn').addEventListener('input', (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); });
+  [$('#codeIn'), $('#nameIn')].forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); }));
+  $('#joinBtn').addEventListener('click', join);
+
+  async function join() {
+    const c = $('#codeIn').value.trim();
+    const n = $('#nameIn').value.trim();
+    $('#joinErr').textContent = '';
+    if (!/^\d{6}$/.test(c)) { $('#joinErr').textContent = '교실 코드 숫자 6자리를 써 주세요.'; return; }
+    if (!n) { $('#joinErr').textContent = '이름을 써 주세요.'; return; }
+    $('#joinBtn').disabled = true;
+    try {
+      await api('GET', `/api/room/${c}`);
+    } catch (e) {
+      $('#joinErr').textContent = e.message + ' 선생님께 코드를 다시 확인해 주세요.';
+      $('#joinBtn').disabled = false;
+      return;
+    }
+    code = c; name = n;
+    if ($('#rememberIn').checked) store.set('student', { code, name }); else store.del('student');
+    connect();
+  }
+
+  function connect() {
+    socket = io();
+    socket.on('connect', () => {
+      socket.emit('join', { code, role: 'student', name }, (r) => {
+        if (r.error) { toast(r.error); return; }
+        teacherId = r.teacherId;
+        $('#teacherWait').classList.toggle('hidden', !!teacherId);
+        showRoom(r.state);
+        // 다시 연결된 경우 공유 중이었다면 이어서 연결
+        if (stream) { socket.emit('share-state', true); startPeer(); }
+      });
+    });
+    socket.on('disconnect', () => { if (pc) { pc.close(); pc = null; } });
+
+    socket.on('teacher-online', (m) => {
+      teacherId = m.teacherId;
+      $('#teacherWait').classList.add('hidden');
+      if (stream) startPeer();
+    });
+    socket.on('teacher-offline', () => {
+      teacherId = null;
+      if (pc) { pc.close(); pc = null; }
+    });
+
+    socket.on('signal', async ({ from, data }) => {
+      if (!pc || from !== teacherId) return;
+      try {
+        if (data.sdp) await pc.setRemoteDescription(data.sdp);
+        else if (data.candidate) await pc.addIceCandidate(data.candidate);
+      } catch (e) { console.warn(e); }
+    });
+
+    socket.on('end-share', () => {
+      if (stream) { stopShare(); toast('선생님이 화면 공유를 끝냈어요.'); }
+    });
+
+    socket.on('link', ({ url }) => {
+      $('#linkUrl').textContent = url;
+      $('#linkBar').classList.remove('hidden');
+      $('#linkOpen').onclick = () => window.open(url, '_blank', 'noopener');
+      toast('선생님이 링크를 보냈어요!');
+    });
+
+    socket.on('prompts', (list) => {
+      renderPromptsReadonly($('#promptList'), list);
+      bumpBadge('pPrompt');
+      toast('새 프롬프트가 올라왔어요.');
+    });
+    socket.on('post-added', (p) => { if (board && board.add(p)) bumpBadge('pBoard'); });
+    socket.on('post-removed', (id) => board && board.remove(id));
+    socket.on('posts-cleared', () => board && board.clear());
+  }
+
+  let shown = false;
+  function showRoom(state) {
+    renderPromptsReadonly($('#promptList'), state.prompts);
+    if (!shown) {
+      shown = true;
+      $('#joinView').classList.add('hidden');
+      $('#roomView').classList.remove('hidden');
+      $('#codeChip').textContent = code;
+      $('#meName').textContent = '🙂 ' + name;
+      setupTabs();
+      board = createBoard($('#boardRoot'), {
+        code: () => code,
+        getName: () => name,
+        myPosts,
+        onMyPostsChange: () => store.set('my-posts', [...myPosts].slice(-200))
+      });
+    }
+    board.setAll(state.posts);
+  }
+
+  // ---------- 화면 공유 ----------
+  $('#shareBtn').addEventListener('click', startShare);
+  $('#stopBtn').addEventListener('click', stopShare);
+  $('#linkClose').addEventListener('click', () => $('#linkBar').classList.add('hidden'));
+
+  async function startShare() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      toast('이 기기에서는 화면 공유가 안 돼요. 학교 PC의 크롬에서 열어 주세요.');
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 8, max: 12 }, width: { max: 1600 }, height: { max: 1000 } },
+        audio: false
+      });
+    } catch (e) {
+      toast('화면 공유를 취소했어요.');
+      return;
+    }
+    // 크롬 아래쪽 '공유 중지'를 누른 경우
+    stream.getVideoTracks()[0].addEventListener('ended', () => stopShare());
+    setShareUI(true);
+    socket.emit('share-state', true);
+    startPeer();
+  }
+
+  function stopShare() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    if (pc) { pc.close(); pc = null; }
+    if (socket) socket.emit('share-state', false);
+    setShareUI(false);
+  }
+
+  function setShareUI(on) {
+    $('#sharingBar').classList.toggle('hidden', !on);
+    $('#shareBtn').classList.toggle('hidden', on);
+    $('#stopBtn').classList.toggle('hidden', !on);
+    $('#shareIntro').classList.toggle('hidden', on);
+    const st = $('#shareStatus');
+    st.textContent = on ? '✅ 내 화면 공유 중 · 선생님이 보고 있어요' : '아직 화면을 공유하지 않았어요';
+    st.className = 'status-big ' + (on ? 'ok' : 'wait');
+    document.title = on ? '🟢 공유 중 — 우리 반 교실' : '우리 반 교실 — 학생';
+  }
+
+  async function startPeer() {
+    if (!stream || !teacherId || !socket) return;
+    if (pc) pc.close();
+    const target = teacherId;
+    const conn = new RTCPeerConnection(RTC_CONFIG);
+    pc = conn;
+    conn.onicecandidate = (e) => { if (e.candidate) socket.emit('signal', { to: target, data: { candidate: e.candidate } }); };
+    conn.onconnectionstatechange = () => {
+      if (conn === pc && conn.connectionState === 'failed') setTimeout(() => { if (conn === pc) startPeer(); }, 2000);
+    };
+    stream.getTracks().forEach((t) => {
+      const sender = conn.addTrack(t, stream);
+      // 15명이 함께 보내도 버틸 수 있게 화질을 조금 낮춤
+      try {
+        const p = sender.getParameters();
+        p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
+        p.encodings[0].maxBitrate = 600000;
+        sender.setParameters(p).catch(() => {});
+      } catch (e) {}
+    });
+    const offer = await conn.createOffer();
+    await conn.setLocalDescription(offer);
+    socket.emit('signal', { to: target, data: { sdp: conn.localDescription } });
+  }
+
+  // 공유 중에 창을 닫으려 하면 한 번 더 물어봄
+  window.addEventListener('beforeunload', (e) => {
+    if (stream) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  $('#leaveBtn').addEventListener('click', () => {
+    if (stream && !confirm('화면 공유가 멈춰요. 나갈까요?')) return;
+    stopShare();
+    location.href = '/';
+  });
+})();
+</script>
+</body>
+</html>

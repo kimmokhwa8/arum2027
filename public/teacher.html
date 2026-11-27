@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>우리 반 교실 — 선생님</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">👩‍🏫 우리 반 교실</span>
+  <span>교실 코드</span>
+  <span class="code-chip" id="codeChip">······</span>
+  <button class="btn small" id="bigCodeBtn">코드 크게 보기</button>
+  <nav class="tabs">
+    <button class="tab active" data-panel="pShare">📺 화면 공유</button>
+    <button class="tab" data-panel="pPrompt">📋 프롬프트</button>
+    <button class="tab" data-panel="pBoard">📁 게시판</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="connState" class="muted" style="font-size:14px">연결 중…</span>
+</header>
+
+<main>
+  <!-- 화면 공유 -->
+  <section id="pShare" class="panel active">
+    <div class="toolbar">
+      <span class="counter" id="counter">들어온 학생 0명</span>
+      <div class="group" id="layoutGroup">
+        <button class="btn on" data-layout="">전체 보기</button>
+        <button class="btn" data-layout="g4">4분할</button>
+        <button class="btn" data-layout="g1">1명씩 크게</button>
+      </div>
+      <div class="group" id="sortGroup">
+        <button class="btn on" data-sort="name">이름순</button>
+        <button class="btn" data-sort="joined">들어온 순</button>
+      </div>
+      <button class="btn" id="linkBtn">🔗 링크 보내기</button>
+      <button class="btn danger" id="endAllBtn">전체 종료</button>
+    </div>
+    <div class="card hidden" id="linkForm" style="margin-bottom:14px">
+      <div class="row">
+        <input type="url" id="linkIn" placeholder="학생들에게 보낼 주소 (https://...)" style="flex:1;min-width:260px">
+        <button class="btn primary" id="linkSend">학생 모두에게 보내기</button>
+      </div>
+      <div class="muted" style="font-size:14px;margin-top:6px">학생 화면 위쪽에 링크와 [열기] 버튼이 떠요.</div>
+    </div>
+    <div id="grid" class="grid"></div>
+    <div id="emptyGrid" class="empty">
+      <div class="emoji">🙋</div>
+      <div>아직 들어온 학생이 없어요.</div>
+      <div style="margin-top:8px">학생들은 <b id="studentUrl"></b> 에 들어가<br>교실 코드 <b id="codeText"></b> 와 이름을 넣으면 돼요.</div>
+    </div>
+  </section>
+
+  <!-- 프롬프트 -->
+  <section id="pPrompt" class="panel">
+    <div class="card editor">
+      <div style="font-weight:800;font-size:19px;margin-bottom:4px" id="editorTitle">✏️ 프롬프트 추가하기</div>
+      <label class="field" for="pTitle">제목 (선택)</label>
+      <input type="text" id="pTitle" maxlength="100" placeholder="예: 1단계 — 나를 소개하는 문장 만들기">
+      <label class="field" for="pText">프롬프트 내용</label>
+      <textarea id="pText" maxlength="5000" rows="5" placeholder="학생들이 복사해서 붙여 넣을 내용을 써 주세요."></textarea>
+      <div class="row" style="margin-top:12px;justify-content:flex-end">
+        <button class="btn hidden" id="pCancel">취소</button>
+        <button class="btn primary" id="pSave">추가하기</button>
+      </div>
+    </div>
+    <p class="muted">학생 화면에는 아래 순서대로 [복사] 버튼과 함께 보여요. 바꾸면 학생 화면에도 바로 바뀌어요.</p>
+    <div id="promptList" class="prompt-list"></div>
+  </section>
+
+  <!-- 게시판 -->
+  <section id="pBoard" class="panel">
+    <div id="boardRoot"></div>
+  </section>
+</main>
+
+<div id="overlay" class="overlay hidden"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/common.js"></script>
+<script>
+(async () => {
+  let code = '', teacherKey = '';
+  let prompts = [];
+  let layout = '', sortBy = 'name';
+  let board = null;
+  const students = new Map(); // id -> { name, joinedAt, sharing, pc, stream, tile }
+
+  // ---------- 교실 열기 ----------
+  const saved = store.get('teacher', {});
+  let r;
+  try {
+    r = await api('POST', '/api/room', { code: saved.code, teacherKey: saved.teacherKey });
+  } catch (e) {
+    toast('서버에 연결하지 못했어요. 새로고침해 주세요.');
+    return;
+  }
+  code = r.code; teacherKey = r.teacherKey;
+  store.set('teacher', { code, teacherKey });
+  prompts = r.state.prompts;
+
+  // 서버가 쉬었다가 깨어나 프롬프트가 비어 있으면, 이 컴퓨터에 백업해 둔 것으로 되살림
+  const backup = store.get('prompt-backup', []);
+  if (!prompts.length && backup.length) {
+    prompts = backup;
+    await savePrompts(true);
+    toast('저장해 둔 프롬프트를 다시 불러왔어요.');
+  }
+
+  $('#codeChip').textContent = code;
+  $('#codeText').textContent = code;
+  $('#studentUrl').textContent = location.origin + '/student.html';
+
+  setupTabs();
+  renderPrompts();
+  board = createBoard($('#boardRoot'), { code: () => code, teacherKey, getName: () => '선생님', myPosts: new Set() });
+  board.setAll(r.state.posts);
+
+  // ---------- 실시간 연결 ----------
+  const socket = io();
+  socket.on('connect', () => {
+    $('#connState').textContent = '🟢 연결됨';
+    socket.emit('join', { code, role: 'teacher', teacherKey }, (res) => {
+      if (res.error) { toast(res.error); return; }
+      // 다시 연결되면 학생 목록을 새로 받음
+      for (const id of [...students.keys()]) removeStudent(id);
+      res.students.forEach(addStudent);
+      board.setAll(res.state.posts);
+    });
+  });
+  socket.on('disconnect', () => { $('#connState').textContent = '🔴 연결 끊김 — 다시 연결하는 중'; });
+
+  socket.on('student-joined', addStudent);
+  socket.on('student-left', ({ id }) => removeStudent(id));
+  socket.on('student-state', ({ id, sharing }) => {
+    const s = students.get(id);
+    if (!s) return;
+    s.sharing = sharing;
+    if (!sharing) closePeer(s);
+    renderGrid();
+  });
+
+  socket.on('signal', async ({ from, data }) => {
+    const s = students.get(from);
+    if (!s) return;
+    try {
+      if (data.sdp && data.sdp.type === 'offer') {
+        closePeer(s);
+        const conn = new RTCPeerConnection(RTC_CONFIG);
+        s.pc = conn;
+        conn.onicecandidate = (e) => { if (e.candidate) socket.emit('signal', { to: from, data: { candidate: e.candidate } }); };
+        conn.ontrack = (e) => {
+          s.stream = e.streams[0] || new MediaStream([e.track]);
+          s.sharing = true;
+          attachVideo(s);
+          renderGrid();
+        };
+        await conn.setRemoteDescription(data.sdp);
+        const answer = await conn.createAnswer();
+        await conn.setLocalDescription(answer);
+        socket.emit('signal', { to: from, data: { sdp: conn.localDescription } });
+      } else if (data.candidate && s.pc) {
+        await s.pc.addIceCandidate(data.candidate);
+      }
+    } catch (e) { console.warn(e); }
+  });
+
+  socket.on('post-added', (p) => { if (board.add(p)) bumpBadge('pBoard'); });
+  socket.on('post-removed', (id) => board.remove(id));
+  socket.on('posts-cleared', () => board.clear());
+
+  // ---------- 학생 화면 타일 ----------
+  function addStudent(st) {
+    const s = { name: st.name, joinedAt: st.joinedAt, sharing: st.sharing, pc: null, stream: null, tile: null };
+    const video = el('video', { autoplay: '', playsinline: '' });
+    video.muted = true;
+    const waiting = el('div', { class: 'waiting' });
+    s.tile = el('div', { class: 'tile' }, video, waiting, el('div', { class: 'label', text: st.name }));
+    s.video = video; s.waiting = waiting;
+    s.tile.addEventListener('click', () => openFocus(st.id));
+    students.set(st.id, s);
+    renderGrid();
+  }
+  function removeStudent(id) {
+    const s = students.get(id);
+    if (!s) return;
+    closePeer(s);
+    s.tile.remove();
+    students.delete(id);
+    renderGrid();
+  }
+  function closePeer(s) {
+    if (s.pc) { s.pc.close(); s.pc = null; }
+    s.stream = null;
+    if (s.video) s.video.srcObject = null;
+  }
+  function attachVideo(s) {
+    s.video.srcObject = s.stream;
+    s.video.play().catch(() => {});
+  }
+
+  function renderGrid() {
+    const grid = $('#grid');
+    grid.className = 'grid' + (layout ? ' ' + layout : '');
+    const arr = [...students.entries()].sort((a, b) =>
+      sortBy === 'name' ? a[1].name.localeCompare(b[1].name, 'ko') : a[1].joinedAt - b[1].joinedAt);
+    arr.forEach(([, s]) => {
+      const live = !!s.stream;
+      s.waiting.textContent = live ? '' : (s.sharing ? '연결하는 중…' : '아직 화면 공유 전이에요');
+      s.waiting.classList.toggle('hidden', live);
+      grid.append(s.tile); // 정렬 순서대로 다시 붙임
+    });
+    const sharing = arr.filter(([, s]) => s.stream).length;
+    $('#counter').textContent = `들어온 학생 ${arr.length}명 · 화면 공유 중 ${sharing}명`;
+    $('#emptyGrid').classList.toggle('hidden', arr.length > 0);
+  }
+
+  // 한 명 크게 보기
+  function openFocus(id) {
+    const s = students.get(id);
+    if (!s) return;
+    const ov = $('#overlay');
+    const v = el('video', { autoplay: '', playsinline: '' });
+    v.muted = true;
+    if (s.stream) v.srcObject = s.stream;
+    ov.replaceChildren(
+      el('div', { class: 'ov-head' }, '🙂 ' + s.name, el('button', { class: 'btn', text: '닫기 (Esc)', onclick: closeOverlay })),
+      s.stream ? v : el('div', { class: 'hint', text: '아직 화면 공유 전이에요.' })
+    );
+    ov.classList.remove('hidden');
+    v.play && v.play().catch(() => {});
+  }
+  function closeOverlay() { $('#overlay').classList.add('hidden'); $('#overlay').replaceChildren(); }
+  $('#overlay').addEventListener('click', (e) => { if (e.target.id === 'overlay') closeOverlay(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeOverlay(); });
+
+  $('#bigCodeBtn').addEventListener('click', () => {
+    const ov = $('#overlay');
+    ov.replaceChildren(
+      el('div', { class: 'bigcode', text: code }),
+      el('div', { class: 'hint', text: '학생들: ' + location.origin + '/student.html 에서 위 코드를 넣어요' }),
+      el('button', { class: 'btn', style: 'margin-top:24px', text: '닫기', onclick: closeOverlay })
+    );
+    ov.classList.remove('hidden');
+  });
+
+  $('#layoutGroup').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    layout = b.dataset.layout;
+    $('#layoutGroup').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+    renderGrid();
+  });
+  $('#sortGroup').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    sortBy = b.dataset.sort;
+    $('#sortGroup').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+    renderGrid();
+  });
+
+  $('#endAllBtn').addEventListener('click', () => {
+    if (!confirm('모든 학생의 화면 공유를 끝낼까요?')) return;
+    socket.emit('end-all');
+    toast('모든 학생의 화면 공유를 끝냈어요.');
+  });
+
+  $('#linkBtn').addEventListener('click', () => { $('#linkForm').classList.toggle('hidden'); $('#linkIn').focus(); });
+  $('#linkSend').addEventListener('click', () => {
+    let u = $('#linkIn').value.trim();
+    if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+    if (!u) { toast('보낼 주소를 써 주세요.'); return; }
+    socket.emit('send-link', u);
+    toast('학생들에게 링크를 보냈어요.');
+    $('#linkIn').value = '';
+  });
+  $('#linkIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#linkSend').click(); });
+
+  // ---------- 프롬프트 관리 ----------
+  let editingId = null;
+
+  async function savePrompts(silent) {
+    store.set('prompt-backup', prompts);
+    try {
+      const res = await api('PUT', `/api/room/${code}/prompts`, { prompts }, { 'x-teacher-key': teacherKey });
+      prompts = res.prompts;
+      store.set('prompt-backup', prompts);
+      if (!silent) toast('학생 화면에도 바로 반영했어요.');
+    } catch (e) { toast(e.message); }
+    renderPrompts();
+  }
+
+  function resetEditor() {
+    editingId = null;
+    $('#pTitle').value = ''; $('#pText').value = '';
+    $('#editorTitle').textContent = '✏️ 프롬프트 추가하기';
+    $('#pSave').textContent = '추가하기';
+    $('#pCancel').classList.add('hidden');
+  }
+
+  $('#pSave').addEventListener('click', () => {
+    const title = $('#pTitle').value.trim();
+    const text = $('#pText').value.trim();
+    if (!text) { toast('프롬프트 내용을 써 주세요.'); return; }
+    if (editingId) {
+      const p = prompts.find((x) => x.id === editingId);
+      if (p) { p.title = title; p.text = text; }
+    } else {
+      prompts.push({ id: Math.random().toString(36).slice(2, 10), title, text });
+    }
+    resetEditor();
+    savePrompts();
+  });
+  $('#pCancel').addEventListener('click', resetEditor);
+
+  function renderPrompts() {
+    const box = $('#promptList');
+    box.replaceChildren();
+    if (!prompts.length) {
+      box.append(el('div', { class: 'empty' }, el('div', { class: 'emoji', text: '📋' }), el('div', { text: '위에서 첫 프롬프트를 추가해 보세요.' })));
+      return;
+    }
+    prompts.forEach((p, i) => {
+      const move = (d) => {
+        const j = i + d;
+        if (j < 0 || j >= prompts.length) return;
+        [prompts[i], prompts[j]] = [prompts[j], prompts[i]];
+        savePrompts(true);
+      };
+      box.append(el('div', { class: 'prompt' },
+        el('div', { class: 'num', text: String(i + 1) }),
+        el('div', { class: 'body' },
+          p.title ? el('div', { class: 'title', text: p.title }) : null,
+          el('div', { class: 'text', text: p.text })
+        ),
+        el('div', { class: 'tools' },
+          el('button', { class: 'btn small', text: '▲ 위로', disabled: i === 0 ? '' : false, onclick: () => move(-1) }),
+          el('button', { class: 'btn small', text: '▼ 아래로', disabled: i === prompts.length - 1 ? '' : false, onclick: () => move(1) }),
+          el('button', { class: 'btn small', text: '수정', onclick: () => {
+            editingId = p.id;
+            $('#pTitle').value = p.title; $('#pText').value = p.text;
+            $('#editorTitle').textContent = `✏️ ${i + 1}번 프롬프트 수정하기`;
+            $('#pSave').textContent = '수정 저장';
+            $('#pCancel').classList.remove('hidden');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          } }),
+          el('button', { class: 'btn small', text: '삭제', onclick: () => {
+            if (!confirm('이 프롬프트를 지울까요?')) return;
+            prompts = prompts.filter((x) => x.id !== p.id);
+            savePrompts();
+          } })
+        )
+      ));
+    });
+  }
+})();
+</script>
+</body>
+</html>
